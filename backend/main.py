@@ -8,6 +8,7 @@ import os
 import json
 import time
 import logging
+import tempfile
 import schedule
 import requests
 from bs4 import BeautifulSoup
@@ -22,13 +23,34 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ── Firebase init ──────────────────────────────────────────────────────────────
-cred_path = os.environ.get("FIREBASE_CREDENTIALS_PATH", "firebase-credentials.json")
-if os.path.exists(cred_path):
-    cred = credentials.Certificate(cred_path)
-    firebase_admin.initialize_app(cred)
-    log.info("Firebase inicializado correctamente")
-else:
-    log.warning("firebase-credentials.json no encontrado. Notificaciones desactivadas.")
+def init_firebase():
+    # Opción 1: variable de entorno (Railway)
+    cred_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
+    if cred_json:
+        try:
+            cred_dict = json.loads(cred_json)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+            log.info("Firebase inicializado desde variable de entorno ✓")
+            return True
+        except Exception as e:
+            log.error(f"Error inicializando Firebase desde env var: {e}")
+
+    # Opción 2: archivo local (desarrollo)
+    cred_path = "firebase-credentials.json"
+    if os.path.exists(cred_path):
+        try:
+            cred = credentials.Certificate(cred_path)
+            firebase_admin.initialize_app(cred)
+            log.info("Firebase inicializado desde archivo local ✓")
+            return True
+        except Exception as e:
+            log.error(f"Error inicializando Firebase desde archivo: {e}")
+
+    log.warning("Firebase NO inicializado — notificaciones desactivadas")
+    return False
+
+FIREBASE_OK = init_firebase()
 
 # ── Configuración persistente (reglas por proyecto) ───────────────────────────
 RULES_FILE = "rules.json"
@@ -105,7 +127,6 @@ PROJECT_KEY_MAP = {
 
 # ── Scraper ───────────────────────────────────────────────────────────────────
 def scrape_offers():
-    """Descarga y parsea todas las ofertas visibles en mercadosecundario.briq.mx"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
     }
@@ -119,24 +140,22 @@ def scrape_offers():
     soup = BeautifulSoup(resp.text, "html.parser")
     offers = []
 
-    # Cada proyecto está en un bloque <section> o contenedor con <h2> y una <table>
     for h2 in soup.find_all("h2"):
         project_name = h2.get_text(strip=True)
         table = h2.find_next("table")
         if not table:
             continue
 
-        for row in table.find_all("tr")[1:]:  # saltar encabezado
+        for row in table.find_all("tr")[1:]:
             cols = row.find_all("td")
             if len(cols) < 6:
                 continue
-            offer_id   = cols[0].get_text(strip=True)          # e.g. #27489
-            diferencia = cols[4].get_text(strip=True)          # e.g. "25.89% abajo del valor actual"
-            precio_txt = cols[5].get_text(strip=True)          # e.g. "Comprar por $10,000.00"
+            offer_id   = cols[0].get_text(strip=True)
+            diferencia = cols[4].get_text(strip=True)
+            precio_txt = cols[5].get_text(strip=True)
             link_tag   = cols[5].find("a", href=True)
             link       = link_tag["href"] if link_tag else ""
 
-            # Parsear descuento
             discount = parse_discount(diferencia)
             price    = parse_price(precio_txt)
 
@@ -155,7 +174,6 @@ def scrape_offers():
     return offers
 
 def parse_discount(texto: str):
-    """Extrae el porcentaje de descuento. Negativo = sobre valor."""
     import re
     m = re.search(r"([\d.]+)%\s*(abajo|arriba)", texto, re.IGNORECASE)
     if not m:
@@ -166,7 +184,6 @@ def parse_discount(texto: str):
     return val
 
 def parse_price(texto: str):
-    """Extrae precio numérico de texto como 'Comprar por $10,000.00'"""
     import re
     m = re.search(r"\$([\d,]+\.?\d*)", texto)
     if m:
@@ -175,12 +192,16 @@ def parse_price(texto: str):
 
 # ── Enviar notificación push ──────────────────────────────────────────────────
 def send_push(offer: dict, threshold: float):
-    token = get_device_token()
-    if not token:
-        log.warning("No hay token FCM registrado. No se envió notificación.")
+    if not FIREBASE_OK:
+        log.warning("Firebase no disponible, no se envió push")
         return
 
-    disc_str = f"{offer['discount']:.1f}% abajo"
+    token = get_device_token()
+    if not token:
+        log.warning("No hay token FCM registrado aún")
+        return
+
+    disc_str  = f"{offer['discount']:.1f}% abajo"
     price_str = f"${offer['price']:,.0f}"
 
     message = messaging.Message(
@@ -189,12 +210,12 @@ def send_push(offer: dict, threshold: float):
             body=f"{offer['id']} — {disc_str} · {price_str}",
         ),
         data={
-            "offer_id":   offer["id"],
-            "project":    offer["project"],
-            "discount":   str(offer["discount"]),
-            "price":      str(offer["price"]),
-            "link":       offer["link"],
-            "threshold":  str(threshold),
+            "offer_id":  offer["id"],
+            "project":   offer["project"],
+            "discount":  str(offer["discount"]),
+            "price":     str(offer["price"]),
+            "link":      offer["link"],
+            "threshold": str(threshold),
         },
         android=messaging.AndroidConfig(
             priority="high",
@@ -240,14 +261,19 @@ def check_offers():
     save_notified(notified)
     log.info(f"Verificación completa. Nuevas alertas: {new_alerts}")
 
-# ── API REST (para la app Android) ───────────────────────────────────────────
+# ── API REST ──────────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat()})
+    return jsonify({
+        "status":   "ok",
+        "firebase": FIREBASE_OK,
+        "token":    bool(get_device_token()),
+        "time":     datetime.utcnow().isoformat()
+    })
 
 @app.route("/register-token", methods=["POST"])
 def register_token():
-    data = request.get_json()
+    data  = request.get_json()
     token = data.get("token", "")
     if not token:
         return jsonify({"error": "token requerido"}), 400
@@ -261,7 +287,7 @@ def get_rules():
 
 @app.route("/rules", methods=["POST"])
 def update_rules():
-    data = request.get_json()
+    data  = request.get_json()
     rules = load_rules()
     for key, val in data.items():
         if key in rules:
@@ -271,8 +297,7 @@ def update_rules():
 
 @app.route("/offers", methods=["GET"])
 def get_offers():
-    offers = scrape_offers()
-    return jsonify(offers)
+    return jsonify(scrape_offers())
 
 @app.route("/check", methods=["POST"])
 def force_check():
@@ -289,10 +314,11 @@ def run_scheduler():
             time.sleep(10)
     t = threading.Thread(target=loop, daemon=True)
     t.start()
-    log.info("Scheduler iniciado: verificación cada 2 minutos")
+    log.info("Scheduler iniciado: verificación cada 2 minutos ✓")
 
 if __name__ == "__main__":
     run_scheduler()
-    check_offers()  # verificación inmediata al arrancar
+    check_offers()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
