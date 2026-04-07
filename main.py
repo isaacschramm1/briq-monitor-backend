@@ -1,14 +1,12 @@
 """
 Briq Monitor Backend
 Scraper + Alert service para mercadosecundario.briq.mx
-Deploy en Railway o Fly.io
 """
 
 import os
 import json
 import time
 import logging
-import tempfile
 import schedule
 import requests
 from bs4 import BeautifulSoup
@@ -24,7 +22,6 @@ app = Flask(__name__)
 
 # ── Firebase init ──────────────────────────────────────────────────────────────
 def init_firebase():
-    # Opción 1: variable de entorno (Railway)
     cred_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
     if cred_json:
         try:
@@ -36,7 +33,6 @@ def init_firebase():
         except Exception as e:
             log.error(f"Error inicializando Firebase desde env var: {e}")
 
-    # Opción 2: archivo local (desarrollo)
     cred_path = "firebase-credentials.json"
     if os.path.exists(cred_path):
         try:
@@ -52,7 +48,7 @@ def init_firebase():
 
 FIREBASE_OK = init_firebase()
 
-# ── Configuración persistente (reglas por proyecto) ───────────────────────────
+# ── Reglas por defecto ────────────────────────────────────────────────────────
 RULES_FILE = "rules.json"
 
 DEFAULT_RULES = {
@@ -74,15 +70,18 @@ DEFAULT_RULES = {
 
 def load_rules():
     if os.path.exists(RULES_FILE):
-        with open(RULES_FILE) as f:
-            return json.load(f)
+        try:
+            with open(RULES_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
     return DEFAULT_RULES.copy()
 
 def save_rules(rules):
     with open(RULES_FILE, "w") as f:
         json.dump(rules, f, ensure_ascii=False, indent=2)
 
-# ── FCM token del dispositivo ─────────────────────────────────────────────────
+# ── FCM token ─────────────────────────────────────────────────────────────────
 TOKEN_FILE = "device_token.txt"
 
 def get_device_token():
@@ -94,36 +93,71 @@ def save_device_token(token):
     with open(TOKEN_FILE, "w") as f:
         f.write(token)
 
-# ── Ofertas ya notificadas (evita spam) ───────────────────────────────────────
+# ── Ofertas ya notificadas ────────────────────────────────────────────────────
 NOTIFIED_FILE = "notified.json"
 
 def load_notified():
     if os.path.exists(NOTIFIED_FILE):
-        with open(NOTIFIED_FILE) as f:
-            return set(json.load(f))
+        try:
+            with open(NOTIFIED_FILE) as f:
+                return set(json.load(f))
+        except Exception:
+            pass
     return set()
 
 def save_notified(ids: set):
     with open(NOTIFIED_FILE, "w") as f:
         json.dump(list(ids), f)
 
-# ── Mapeo nombre de proyecto → clave de regla ─────────────────────────────────
-PROJECT_KEY_MAP = {
-    "Edificio Local Narvarte":       "narvarte",
-    "Hotel San Miguel de Allende":   "sanmiguel",
-    "Sanâh Tulum":                   "sanah",
-    "UBIKA El Refugio":              "ubika_ref",
-    "UBIKA Mariano Otero":           "ubika_mar",
-    "The Wesley":                    "wesley",
-    "Jacksonville Hotel":            "jacksonville",
-    "Multi-Tex Platform":            "multitex",
-    "Alarcón PerSe":                 "alarcon",
-    "Álamos Lifestyle Center":       "alamos",
-    "14 Clinton Street":             "clinton",
-    "Nextipark":                     "nextipark",
-    "Salara Hotel":                  "salara",
-    "Fondo AGGE":                    "agge",
+# ── Mapeo por palabras clave (robusto a caracteres especiales) ─────────────────
+KEYWORD_MAP = {
+    "narvarte":     "narvarte",
+    "san miguel":   "sanmiguel",
+    "tulum":        "sanah",
+    "refugio":      "ubika_ref",
+    "otero":        "ubika_mar",
+    "wesley":       "wesley",
+    "jacksonville": "jacksonville",
+    "multi-tex":    "multitex",
+    "alarcon":      "alarcon",
+    "alarc":        "alarcon",
+    "alamos":       "alamos",
+    "lamos":        "alamos",
+    "clinton":      "clinton",
+    "nextipark":    "nextipark",
+    "salara":       "salara",
+    "agge":         "agge",
 }
+
+PROJECT_SHORT = {
+    "narvarte":     "Narvarte",
+    "sanmiguel":    "San Miguel",
+    "sanah":        "Sanâh Tulum",
+    "ubika_ref":    "UBIKA Refugio",
+    "ubika_mar":    "UBIKA Otero",
+    "wesley":       "The Wesley",
+    "jacksonville": "Jacksonville",
+    "multitex":     "Multi-Tex",
+    "alarcon":      "Alarcón PerSe",
+    "alamos":       "Álamos",
+    "clinton":      "Clinton St",
+    "nextipark":    "Nextipark",
+    "salara":       "Salara",
+    "agge":         "Fondo AGGE",
+}
+
+def get_project_key(name: str) -> str:
+    """Mapeo robusto por palabras clave — ignora tildes y caracteres especiales."""
+    # Normalizar: minúsculas y quitar tildes comunes
+    n = name.lower()
+    n = n.replace("â", "a").replace("á", "a").replace("é", "e") \
+         .replace("í", "i").replace("ó", "o").replace("ú", "u") \
+         .replace("ñ", "n")
+    for keyword, key in KEYWORD_MAP.items():
+        if keyword in n:
+            return key
+    log.warning(f"Proyecto no mapeado: '{name}'")
+    return ""
 
 # ── Scraper ───────────────────────────────────────────────────────────────────
 def scrape_offers():
@@ -145,7 +179,6 @@ def scrape_offers():
         table = h2.find_next("table")
         if not table:
             continue
-
         for row in table.find_all("tr")[1:]:
             cols = row.find_all("td")
             if len(cols) < 6:
@@ -155,26 +188,23 @@ def scrape_offers():
             precio_txt = cols[5].get_text(strip=True)
             link_tag   = cols[5].find("a", href=True)
             link       = link_tag["href"] if link_tag else ""
-
-            discount = parse_discount(diferencia)
-            price    = parse_price(precio_txt)
-
+            discount   = parse_discount(diferencia)
+            price      = parse_price(precio_txt)
             if discount is None:
                 continue
-
             offers.append({
-                "id":       offer_id,
-                "project":  project_name,
-                "discount": discount,
-                "price":    price,
-                "link":     link,
+                "id": offer_id, "project": project_name,
+                "discount": discount, "price": price, "link": link,
             })
 
     log.info(f"Ofertas encontradas: {len(offers)}")
     return offers
 
 def parse_discount(texto: str):
+    """Parsea descuento. Soporta: X% abajo, X% arriba, Sin descuento."""
     import re
+    if "sin descuento" in texto.lower():
+        return 0.0
     m = re.search(r"([\d.]+)%\s*(abajo|arriba)", texto, re.IGNORECASE)
     if not m:
         return None
@@ -190,38 +220,54 @@ def parse_price(texto: str):
         return float(m.group(1).replace(",", ""))
     return 0.0
 
-# ── Enviar notificación push ──────────────────────────────────────────────────
-def send_push(offer: dict, threshold: float):
-    if not FIREBASE_OK:
-        log.warning("Firebase no disponible, no se envió push")
-        return
-
+# ── Notificación agrupada expandible ─────────────────────────────────────────
+def send_grouped_push(new_alerts: list):
     token = get_device_token()
     if not token:
         log.warning("No hay token FCM registrado aún")
         return
 
-    disc_str  = f"{offer['discount']:.1f}% abajo"
-    price_str = f"${offer['price']:,.0f}"
+    count = len(new_alerts)
+
+    summary_parts = []
+    for a in new_alerts[:3]:
+        key   = get_project_key(a["project"])
+        short = PROJECT_SHORT.get(key, a["project"].split()[0])
+        summary_parts.append(f"{short} {a['discount']:.1f}%")
+    if count > 3:
+        summary_parts.append(f"+{count - 3} más")
+    summary_line = " · ".join(summary_parts)
+
+    expanded_lines = []
+    for a in new_alerts:
+        key   = get_project_key(a["project"])
+        short = PROJECT_SHORT.get(key, a["project"])
+        expanded_lines.append(
+            f"• {short} {a['id']} — {a['discount']:.1f}% · ${a['price']:,.0f}"
+        )
+    expanded_body = "\n".join(expanded_lines)
+    title = f"🔔 {count} nueva{'s ofertas' if count > 1 else ' oferta'} en briq.mx"
+
+    alerts_json = json.dumps([{
+        "id": a["id"], "project": a["project"],
+        "discount": a["discount"], "price": a["price"], "link": a["link"]
+    } for a in new_alerts])
 
     message = messaging.Message(
-        notification=messaging.Notification(
-            title=f"🔔 {offer['project']}",
-            body=f"{offer['id']} — {disc_str} · {price_str}",
-        ),
+        notification=messaging.Notification(title=title, body=summary_line),
         data={
-            "offer_id":  offer["id"],
-            "project":   offer["project"],
-            "discount":  str(offer["discount"]),
-            "price":     str(offer["price"]),
-            "link":      offer["link"],
-            "threshold": str(threshold),
+            "alerts_json": alerts_json,
+            "count":       str(count),
+            "expanded":    expanded_body,
+            "title":       title,
+            "summary":     summary_line,
         },
         android=messaging.AndroidConfig(
             priority="high",
             notification=messaging.AndroidNotification(
                 sound="default",
                 channel_id="briq_alerts",
+                ticker=expanded_body,
             ),
         ),
         token=token,
@@ -229,37 +275,38 @@ def send_push(offer: dict, threshold: float):
 
     try:
         resp = messaging.send(message)
-        log.info(f"Push enviado: {offer['id']} ({offer['project']}) → {resp}")
+        log.info(f"Push agrupado enviado: {count} alertas → {resp}")
     except Exception as e:
         log.error(f"Error enviando push: {e}")
 
-# ── Ciclo principal de verificación ──────────────────────────────────────────
+# ── Ciclo principal ───────────────────────────────────────────────────────────
 def check_offers():
     log.info("── Verificando ofertas ──")
-    rules    = load_rules()
-    notified = load_notified()
-    offers   = scrape_offers()
+    rules      = load_rules()
+    notified   = load_notified()
+    offers     = scrape_offers()
+    new_alerts = []
 
-    new_alerts = 0
     for offer in offers:
-        key = PROJECT_KEY_MAP.get(offer["project"])
+        key = get_project_key(offer["project"])
         if not key:
             continue
         rule = rules.get(key)
         if not rule or not rule.get("enabled", True):
             continue
-
         threshold = rule.get("threshold", 20.0)
         if offer["discount"] >= threshold:
             uid = f"{offer['id']}-{offer['discount']}"
             if uid not in notified:
-                log.info(f"ALERTA: {offer['project']} {offer['id']} {offer['discount']}% (umbral {threshold}%)")
-                send_push(offer, threshold)
+                log.info(f"ALERTA: {offer['project']} {offer['id']} {offer['discount']:.2f}% (umbral {threshold}%)")
+                new_alerts.append(offer)
                 notified.add(uid)
-                new_alerts += 1
+
+    if new_alerts:
+        send_grouped_push(new_alerts)
 
     save_notified(notified)
-    log.info(f"Verificación completa. Nuevas alertas: {new_alerts}")
+    log.info(f"Verificación completa. Nuevas alertas: {len(new_alerts)}")
 
 # ── API REST ──────────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
@@ -287,13 +334,17 @@ def get_rules():
 
 @app.route("/rules", methods=["POST"])
 def update_rules():
-    data  = request.get_json()
-    rules = load_rules()
-    for key, val in data.items():
-        if key in rules:
-            rules[key].update(val)
-    save_rules(rules)
-    return jsonify({"ok": True})
+    try:
+        data  = request.get_json(force=True)
+        rules = load_rules()
+        for key, val in data.items():
+            if key in rules:
+                rules[key].update(val)
+        save_rules(rules)
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.error(f"Error en update_rules: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/offers", methods=["GET"])
 def get_offers():
@@ -304,21 +355,20 @@ def force_check():
     check_offers()
     return jsonify({"ok": True})
 
-# ── Scheduler (cada 2 minutos) ────────────────────────────────────────────────
+# ── Scheduler: cada 1 minuto ──────────────────────────────────────────────────
 def run_scheduler():
     import threading
-    schedule.every(2).minutes.do(check_offers)
+    schedule.every(1).minutes.do(check_offers)
     def loop():
         while True:
             schedule.run_pending()
             time.sleep(10)
     t = threading.Thread(target=loop, daemon=True)
     t.start()
-    log.info("Scheduler iniciado: verificación cada 2 minutos ✓")
+    log.info("Scheduler iniciado: verificación cada 1 minuto ✓")
 
 if __name__ == "__main__":
     run_scheduler()
     check_offers()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
